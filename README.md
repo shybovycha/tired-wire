@@ -36,25 +36,31 @@ This will start a server targeting the specified MongoDB database.
 
 ## Testing
 
-There are two test applications provided:
+There are two test commands in the `test-copy` application provided:
 
-### `test-copy-mongodb`
+### Mongo-to-Mongo using native driver 
 
 Uses MongoDB driver to copy batches of records from one database to another.
 
 Usage:
 
 ```bash
-$ dotnet run -- --source-db mongodb://host:port/database --target-db mongodb://host:port/database --collection collection
+$ dotnet run -- to-mongo --source-db mongodb://host:port/database --target-db mongodb://host:port/database --collection collection
 ```
 
-### `test-copy-avro`
+### Mongo-to-Mongo using TiredWire
 
 Uses Avro serialization and writes serialized records from one MongoDB database through the TiredWire auxilary server to another MongoDB database
 
 Usage:
 
 ```bash
-$ dotnet run -- --source-db mongodb://host:port/database --destination http://host:port/ --collection collection --schema schema.avsc
+$ dotnet run -- to-tired-wire --source-db mongodb://host:port/database --destination http://host:port/ --collection collection --schema schema.avsc
 ```
+
+## Benchmarking
+
+Mongo-to-Mongo using native driver: `3689528` bytes in `?` ms.
+Mongo-to-Mongo using TiredWire: `1384906` bytes in `?` ms.
+Sample collection: `CyclicCrossMapping.orderDetails` containing `8923` documents.
 

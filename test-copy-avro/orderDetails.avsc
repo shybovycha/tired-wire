@@ -1,0 +1,55 @@
+{
+  "type": "record",
+  "name": "orderDetails",
+  "fields": [
+    { "name": "quantity", "type": "long" },
+    { "name": "discount", "type": "double" },
+    { "name": "orderId", "type": "long" },
+    { "name": "productId", "type": "long" },
+    { "name": "unitPrice", "type": "double" },
+    { "name": "order",
+      "type": {
+        "type": "record",
+        "name": "orderDetails.order",
+        "fields": [
+          { "name": "orderId", "type": "long" },
+          { "name": "customerId", "type": "string" },
+          { "name": "employeeId", "type": "long" },
+          { "name": "orderDate",
+            "type": {
+              "type": "record",
+              "name": "orderDetails.order.orderDate",
+              "fields": [
+                { "name": "$date", "type": "string" }
+              ]
+            }
+          },
+          { "name": "requiredDate",
+            "type": {
+              "type": "record",
+              "name": "orderDetails.order.requiredDate",
+              "fields": [
+                { "name": "$date", "type": "string" }
+              ]
+            }
+          },
+          { "name": "shippedDate",
+            "type": ["null",{
+              "type": "record",
+              "name": "orderDetails.order.shippedDate",
+              "fields": [
+                { "name": "$date", "type": "string" }
+              ]
+            }]
+          },
+          { "name": "shipVia", "type": "long" },
+          { "name": "freight", "type": "double" },
+          { "name": "shipName", "type": "string" },
+          { "name": "shipAddress", "type": "string" },
+          { "name": "shipCity", "type": "string" },
+          { "name": "shipRegion", "type": ["null", "string"] },
+          { "name": "shipPostalCode", "type": ["null", "string"] },
+          { "name": "shipCountry", "type": "string" }
+        ]}
+    }
+]}

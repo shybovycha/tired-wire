@@ -50,7 +50,7 @@ void RunApp(string mongoUrl)
 
     app.MapPost(
         "/schema",
-        async (HttpRequest request) =>
+        async (HttpRequest request, ILogger<Program> logger) =>
         {
             using var reader = new StreamReader(request.Body, Encoding.UTF8);
             var schemaJson = await reader.ReadToEndAsync();
@@ -62,10 +62,11 @@ void RunApp(string mongoUrl)
                 var id = Guid.NewGuid().ToString();
                 schemaDict[id] = schemaJson;
 
-                return Results.Ok(new { id });
+                return Results.Text(id, "text/plain", statusCode: StatusCodes.Status201Created);
             }
             catch (Exception ex)
             {
+                logger.LogError(ex, "Can not parse schema");
                 return Results.BadRequest(new { error = $"Invalid Avro schema: {ex.Message}" });
             }
         }
@@ -136,6 +137,8 @@ void RunApp(string mongoUrl)
                 {
                     await coll.InsertManyAsync(buffer);
                 }
+
+                app.Logger.LogInformation("Inserted {count}", count);
 
                 return Results.Ok(new { inserted = count });
             }
