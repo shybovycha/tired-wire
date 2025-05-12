@@ -9,6 +9,7 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using System.CommandLine;  
 using System.CommandLine.NamingConventionBinder;
+using System.Diagnostics;
 
 var rootCommand = new RootCommand("Stream data into MongoDB")
 {
@@ -44,7 +45,7 @@ void RunApp(string mongoUrl)
 
     builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoUrl));
 
-    var schemaDict = new ConcurrentDictionary<string, string>();
+    var schemaDict = new ConcurrentDictionary<string, Avro.Schema>();
 
     var app = builder.Build();
 
@@ -60,7 +61,7 @@ void RunApp(string mongoUrl)
                 var schema = Avro.Schema.Parse(schemaJson);
 
                 var id = Guid.NewGuid().ToString();
-                schemaDict[id] = schemaJson;
+                schemaDict[id] = schema;
 
                 return Results.Text(id, "text/plain", statusCode: StatusCodes.Status201Created);
             }
@@ -76,76 +77,99 @@ void RunApp(string mongoUrl)
         "/stream/{id}/{collection}",
         async (string id, string collection, IMongoClient mongoClient, HttpRequest request) =>
         {
-            if (!schemaDict.TryGetValue(id, out var schemaJson))
+            if (!schemaDict.TryGetValue(id, out var avroSchema))
             {
                 return Results.NotFound(new { error = "Schema not found" });
             }
 
-            Avro.Schema avroSchema;
-            try
-            {
-                avroSchema = Avro.Schema.Parse(schemaJson);
-            }
-            catch (Exception ex)
-            {
-                return Results.BadRequest(new { error = $"Stored schema invalid: {ex.Message}" });
-            }
-
-            var mongoDbName = MongoUrl.Create(mongoUrl).DatabaseName ?? "test";
-            var db = mongoClient.GetDatabase(mongoDbName);
-            var coll = db.GetCollection<BsonDocument>(collection);
+            // 2. Read the whole request body as a MemoryStream  
+            var mem = new MemoryStream();  
 
             try
             {
-                var decoder = new BinaryDecoder(request.Body);
-                var reader = new GenericReader<GenericRecord>(avroSchema, avroSchema);
+                await request.Body.CopyToAsync(mem);  
+                mem.Position = 0; // rewind
+            }
+            catch
+            {
+                return Results.BadRequest("Unable to read request body");
+            }
 
-                var buffer = new List<BsonDocument>();
-                const int batchSize = 100;
-                int count = 0;
+            _ = Task.Run(async () =>
+            {
+                var mongoDbName = MongoUrl.Create(mongoUrl).DatabaseName ?? "test";
+                var db = mongoClient.GetDatabase(mongoDbName);
+                var coll = db.GetCollection<BsonDocument>(collection);
 
-                while (true)
+                try
                 {
-                    GenericRecord record;
-                    try
+                    var decoder = new BinaryDecoder(mem);
+                    var reader = new GenericReader<GenericRecord>(avroSchema, avroSchema);
+
+                    var buffer = new List<BsonDocument>();
+                    const int batchSize = 100;
+                    int count = 0;
+                    var readingDurations = new List<double>();
+                    var deserializationDurations = new List<double>();
+                    var writeToMongoDurations = new List<double>();
+
+                    while (true)
                     {
-                        record = reader.Read(null, decoder);
-                    }
-                    catch (Avro.AvroException)
-                    {
-                        // EOF (or stream ended), exit loop
-                        break;
+                        var _sw0 = Stopwatch.StartNew();
+                        GenericRecord record;
+                        try
+                        {
+                            record = reader.Read(null, decoder);
+                        }
+                        catch (Avro.AvroException)
+                        {
+                            // EOF (or stream ended), exit loop
+                            break;
+                        }
+                        readingDurations.Add(_sw0.Elapsed.TotalMilliseconds);
+
+                        var _sw1 = Stopwatch.StartNew();
+                        var doc = new BsonDocument();
+                        foreach (var field in ((Avro.RecordSchema)avroSchema).Fields)
+                        {
+                            var val = record[field.Name];
+                            doc[field.Name] = BsonValueCreate(val);
+                        }
+                        buffer.Add(doc);
+                        count++;
+                        deserializationDurations.Add(_sw1.Elapsed.TotalMilliseconds);
+
+                        var _sw2 = Stopwatch.StartNew();
+                        if (buffer.Count >= batchSize)
+                        {
+                            await coll.InsertManyAsync(buffer);
+                            buffer.Clear();
+                            writeToMongoDurations.Add(_sw2.Elapsed.TotalMilliseconds);
+                        }
                     }
 
-                    var doc = new BsonDocument();
-                    foreach (var field in ((Avro.RecordSchema)avroSchema).Fields)
+                    if (buffer.Count > 0)
                     {
-                        var val = record[field.Name];
-                        doc[field.Name] = BsonValueCreate(val);
-                    }
-                    buffer.Add(doc);
-                    count++;
-
-                    if (buffer.Count >= batchSize)
-                    {
+                        var _sw3 = Stopwatch.StartNew();
                         await coll.InsertManyAsync(buffer);
-                        buffer.Clear();
+                        writeToMongoDurations.Add(_sw3.Elapsed.TotalMilliseconds);
                     }
-                }
 
-                if (buffer.Count > 0)
+                    app.Logger.LogInformation("Inserted {count} documents; reading stream time: {readingAvg} ms average ({readingMin} ms min, {readingMax} ms max, {readingSum} ms total); deserialization time: {deserializationAvg} ms ({deserializationMin} ms min, {deserializationMax} ms max, {deserializationTotal} ms total); writing time: {writingAvg} ms avg ({writingMin} ms min, {writingMax} ms max, {writingTotal} ms total); total time: {totalTime} ms", count, readingDurations.Average(), readingDurations.Min(), readingDurations.Max(), readingDurations.Sum(), deserializationDurations.Average(), deserializationDurations.Min(), deserializationDurations.Max(), deserializationDurations.Sum(), writeToMongoDurations.Average(), writeToMongoDurations.Min(), writeToMongoDurations.Max(), writeToMongoDurations.Sum(), readingDurations.Sum() + deserializationDurations.Sum() + writeToMongoDurations.Sum());
+
+                    return Results.Ok(new { inserted = count });
+                }
+                catch (Exception ex)
                 {
-                    await coll.InsertManyAsync(buffer);
+                    return Results.BadRequest(new { error = ex.Message });
                 }
+                finally
+                {
+                    mem.Dispose();
+                }
+            });
 
-                app.Logger.LogInformation("Inserted {count}", count);
-
-                return Results.Ok(new { inserted = count });
-            }
-            catch (Exception ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
+            return Results.Accepted();
         }
     );
 
