@@ -1,4 +1,6 @@
-﻿using System.CommandLine;
+﻿using System.Diagnostics;
+using System.CommandLine;
+using System.Linq;
 using System.Net.Http;
 using System.Text;
 using Avro;
@@ -192,6 +194,7 @@ copyToMongo.SetHandler(
         var targetCollection = targetDatabase.GetCollection<BsonDocument>(coll);
 
         var records = new List<GenericRecord>();
+        var durations = new List<double>();
         using (var cursor = await sourceCollection.FindAsync(FilterDefinition<BsonDocument>.Empty))
         {
             int copied = 0;
@@ -205,15 +208,16 @@ copyToMongo.SetHandler(
 
                 if (batch.Count > 0)
                 {
-                    // Uncomment to remove _id to avoid duplicate keys:
+                    var sw = Stopwatch.StartNew();
                     batch.ForEach(doc => doc.Remove("_id"));
                     await targetCollection.InsertManyAsync(batch);
+                    durations.Add(sw.Elapsed.TotalMilliseconds);
                     copied += batch.Count;
                     bytesCopied += size;
                 }
             }
 
-            Console.WriteLine($"Bytes copied: {bytesCopied}");
+            Console.WriteLine($"Done! Documents written: {copied} ({bytesCopied} bytes); writing time: {durations.Average()} ms average ({durations.Min()} ms min, {durations.Max()} ms max, {durations.Sum()} ms total)");
         }
     },
     sourceConnectionOption,
@@ -225,10 +229,13 @@ copyToTiredWire.SetHandler(
     async (srcConn, coll, destination, schemaPath) =>
     {
         // 1. Read and parse AVRO schema
+        var schemaReadTime = 0.0;
         string avroSchemaJson;
         try
         {
+            var _sw0 = Stopwatch.StartNew();
             avroSchemaJson = await File.ReadAllTextAsync(schemaPath);
+            schemaReadTime = _sw0.Elapsed.TotalMilliseconds;
         }
         catch (Exception ex)
         {
@@ -237,6 +244,8 @@ copyToTiredWire.SetHandler(
         }
 
         // 2. POST schema to destination/schema and store response in id
+        var schemaWriteTime = 0.0;
+        var _sw1 = Stopwatch.StartNew();
         string schemaUrl = $"{destination.TrimEnd('/')}/schema";
         string id;
         using (var httpClient = new HttpClient())
@@ -255,6 +264,7 @@ copyToTiredWire.SetHandler(
                     return;
                 }
                 id = await response.Content.ReadAsStringAsync();
+                schemaWriteTime = _sw1.Elapsed.TotalMilliseconds;
                 Console.WriteLine($"Schema POST succeeded. id: {id}");
             }
             catch (Exception ex)
@@ -265,15 +275,18 @@ copyToTiredWire.SetHandler(
         }
 
         // 3. Parse Avro schema
+        var schemaParseTime = 0.0;
         Schema avroSchema;
         try
         {
+            var _sw2 = Stopwatch.StartNew();
             avroSchema = Schema.Parse(avroSchemaJson);
             if (avroSchema.Tag != Schema.Type.Record)
             {
                 Console.WriteLine("Only Avro Record schemas are supported.");
                 return;
             }
+            schemaParseTime = _sw2.Elapsed.TotalMilliseconds;
         }
         catch (Exception ex)
         {
@@ -294,34 +307,51 @@ copyToTiredWire.SetHandler(
 
         // 5. Fetch and convert documents to GenericRecord (Avro)
         var records = new List<GenericRecord>();
+        var serializationDurations = new List<double>();
         using (var cursor = await sourceCollection.FindAsync(FilterDefinition<BsonDocument>.Empty))
         {
             while (await cursor.MoveNextAsync())
             {
                 foreach (var doc in cursor.Current)
                 {
+                    var sw = Stopwatch.StartNew();
                     var record = ConvertBsonToAvro(doc, (RecordSchema)avroSchema);
+                    serializationDurations.Add(sw.Elapsed.TotalMilliseconds);
                     records.Add(record);
                 }
             }
         }
 
+        var writingStreamTime = 0.0;
+
         // 6. Serialize records to Avro binary
         using var avroStream = new MemoryStream();
-        var writer = new BinaryEncoder(avroStream);
 
-        var genericWriter = new GenericWriter<GenericRecord>(avroSchema);
-
-        foreach (var rec in records)
         {
-            genericWriter.Write(rec, writer);
+            var sw = Stopwatch.StartNew();
+            var writer = new BinaryEncoder(avroStream);
+            var genericWriter = new GenericWriter<GenericRecord>(avroSchema);
+
+            foreach (var rec in records)
+            {
+                genericWriter.Write(rec, writer);
+            }
+
+            writingStreamTime = sw.Elapsed.TotalMilliseconds;
         }
+
+        var avroStreamLength = avroStream.Length;
 
         Console.WriteLine($"Bytes copied: {avroStream.Length}");
         avroStream.Seek(0, SeekOrigin.Begin);
 
         // 7. POST the Avro binary stream
         string streamUrl = $"{destination.TrimEnd('/')}/stream/{id}/{coll}";
+
+        var writingToTiredWireTime = 0.0;
+
+        var _sw = Stopwatch.StartNew();
+
         using (var httpClient = new HttpClient())
         using (var streamContent = new StreamContent(avroStream))
         {
@@ -348,7 +378,9 @@ copyToTiredWire.SetHandler(
             }
         }
 
-        Console.WriteLine($"Done! Documents serialized and posted: {records.Count}");
+        writingToTiredWireTime = _sw.Elapsed.TotalMilliseconds;
+
+        Console.WriteLine($"Done! Documents serialized and posted: {records.Count} ({avroStreamLength} bytes; schema read time: {schemaReadTime} ms; schema parse time: {schemaParseTime} ms; schema write time: {schemaWriteTime} ms; serialization time: {serializationDurations.Average()} ms on average ({serializationDurations.Min()} min, {serializationDurations.Max()} max, {serializationDurations.Sum()} ms total); writing to Avro stream time: {writingStreamTime} ms (total serialization time: {writingStreamTime + serializationDurations.Sum()} ms); writing to TiredWire time: {writingToTiredWireTime} ms (total writing time: {writingStreamTime + serializationDurations.Sum() + writingToTiredWireTime} ms); total-total time: {writingStreamTime + serializationDurations.Sum() + writingToTiredWireTime + schemaReadTime + schemaParseTime + schemaWriteTime} ms");
     },
     sourceConnectionOption,
     collectionOption,
