@@ -1,102 +1,162 @@
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using MongoDB.Bson;
-using MongoDB.Driver;
-using System;
 using System.Collections.Concurrent;
-using System.IO;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
+using System.Text;
 using Avro.Generic;
 using Avro.IO;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.Hosting;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using MongoDB.Bson;
+using MongoDB.Driver;
 
-public class Startup
+// For top-level statements compatibility
+var builder = WebApplication.CreateSlimBuilder(args);
+
+// Parse the MongoDB URL passed via --mongo-url
+string mongoUrl = null;
+for (int i = 0; i < args.Length; i++)
 {
-    private readonly ConcurrentDictionary<string, string> schemaStore = new ConcurrentDictionary<string, string>();
-
-    public void ConfigureServices(IServiceCollection services)
+    if (args[i] == "--mongo-url" && args.Length > i + 1)
     {
-        services.AddRouting();
+        mongoUrl = args[i + 1];
+        break;
     }
+}
 
-    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+if (string.IsNullOrWhiteSpace(mongoUrl))
+{
+    Console.WriteLine("Usage: dotnet run -- --mongo-url <MongoDB connection string>");
+    return;
+}
+
+builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoUrl));
+
+var schemaDict = new ConcurrentDictionary<string, string>();
+
+var app = builder.Build();
+
+app.MapPost(
+    "/schema",
+    async (HttpRequest request) =>
     {
-        if (env.IsDevelopment())
+        using var reader = new StreamReader(request.Body, Encoding.UTF8);
+        var schemaJson = await reader.ReadToEndAsync();
+
+        try
         {
-            app.UseDeveloperExceptionPage();
+            var schema = Avro.Schema.Parse(schemaJson);
+
+            var id = Guid.NewGuid().ToString();
+            schemaDict[id] = schemaJson;
+
+            return Results.Ok(new { id });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = $"Invalid Avro schema: {ex.Message}" });
+        }
+    }
+);
+
+app.MapPost(
+    "/stream/{id}/{collection}",
+    async (string id, string collection, IMongoClient mongoClient, HttpRequest request) =>
+    {
+        if (!schemaDict.TryGetValue(id, out var schemaJson))
+        {
+            return Results.NotFound(new { error = "Schema not found" });
         }
 
-        app.UseRouting();
-
-        app.UseEndpoints(endpoints =>
+        Avro.Schema avroSchema;
+        try
         {
-            endpoints.MapPost("/schema", async context =>
+            avroSchema = Avro.Schema.Parse(schemaJson);
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = $"Stored schema invalid: {ex.Message}" });
+        }
+
+        var mongoDbName = MongoUrl.Create(mongoUrl).DatabaseName ?? "test";
+        var db = mongoClient.GetDatabase(mongoDbName);
+        var coll = db.GetCollection<BsonDocument>(collection);
+
+        try
+        {
+            var decoder = new BinaryDecoder(request.Body);
+            var reader = new GenericReader<GenericRecord>(avroSchema, avroSchema);
+
+            var buffer = new List<BsonDocument>();
+            const int batchSize = 100;
+            int count = 0;
+
+            while (true)
             {
-                using var reader = new StreamReader(context.Request.Body);
-                string schema = await reader.ReadToEndAsync();
-
-                var id = Guid.NewGuid().ToString();
-                schemaStore.TryAdd(id, schema);
-
-                context.Response.StatusCode = 204;
-                await context.Response.WriteAsync($"Schema stored with ID: {id}");
-            });
-
-            endpoints.MapPost("/stream/{id}/{collection}", async context =>
-            {
-                var routeValues = context.Request.RouteValues;
-                var id = routeValues["id"] as string;
-                var collection = routeValues["collection"] as string;
-
-                if (!schemaStore.TryGetValue(id, out string schema))
+                GenericRecord record;
+                try
                 {
-                  await context.Response.WriteAsync("Schema ID not found");
-                  return;
+                    record = reader.Read(null, decoder);
+                }
+                catch (Avro.AvroException)
+                {
+                    // EOF (or stream ended), exit loop
+                    break;
                 }
 
-                var mongoClient = new MongoClient("mongodb://localhost:27017");
-                var database = mongoClient.GetDatabase("avro_database");
-                var collection = database.GetCollection<BsonDocument>(collection);
-
-                using var reader = new BinaryReader(context.Request.Body);
-                byte[] dataBytes = reader.ReadBytes((int)context.Request.Body.Length);
-
-                var parsedSchema = Avro.Schema.Parse(schema) as Avro.RecordSchema;
-                var record = new GenericDatumReader<GenericRecord>(parsedSchema, parsedSchema);
-
-                using var stream = new MemoryStream(dataBytes);
-                var decoder = new BinaryDecoder(stream);
-                GenericRecord genericRecord = record.Read(null, decoder);
-
-                var bsonRecord = new BsonDocument();
-
-                foreach (var field in parsedSchema.Fields)
+                var doc = new BsonDocument();
+                foreach (var field in ((Avro.RecordSchema)avroSchema).Fields)
                 {
-                    bsonRecord.Add(field.Name, genericRecord[field.Name]?.ToString() ?? string.Empty);
+                    var val = record[field.Name];
+                    doc[field.Name] = BsonValueCreate(val);
                 }
+                buffer.Add(doc);
+                count++;
 
-                await collection.InsertOneAsync(bsonRecord);
-                await context.Response.WriteAsync("AVRO data processed and stored");
-            });
-        });
+                if (buffer.Count >= batchSize)
+                {
+                    await coll.InsertManyAsync(buffer);
+                    buffer.Clear();
+                }
+            }
+
+            if (buffer.Count > 0)
+            {
+                await coll.InsertManyAsync(buffer);
+            }
+
+            return Results.Ok(new { inserted = count });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
-}
+);
 
-public class Program
+static BsonValue BsonValueCreate(object val)
 {
-    public static void Main(string[] args)
-    {
-        CreateHostBuilder(args).Build().Run();
-    }
+    if (val == null)
+        return BsonNull.Value;
 
-    public static IHostBuilder CreateHostBuilder(string[] args) =>
-        Host.CreateDefaultBuilder(args)
-            .ConfigureWebHostDefaults(webBuilder =>
-            {
-                webBuilder.UseStartup<Startup>();
-            });
+    return val switch
+    {
+        int i => new BsonInt32(i),
+        long l => new BsonInt64(l),
+        float f => new BsonDouble(f),
+        double d => new BsonDouble(d),
+        bool b => new BsonBoolean(b),
+        string s => new BsonString(s),
+        IDictionary<string, object> dict => new BsonDocument(
+            dict.Select(kv => new BsonElement(kv.Key, BsonValueCreate(kv.Value)))
+        ),
+        GenericRecord record => new BsonDocument(
+            record.Schema.Fields.Select(f => new BsonElement(
+                f.Name,
+                BsonValueCreate(record[f.Name])
+            ))
+        ),
+        IEnumerable<object> arr => new BsonArray(arr.Select(BsonValueCreate)),
+        _ => BsonValue.Create(val),
+    };
 }
+
+app.Run();
